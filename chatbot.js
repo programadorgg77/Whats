@@ -38,6 +38,10 @@ const INTERVALO_MIN = 10 * 60 * 1000;
 const INTERVALO_MAX = 15 * 60 * 1000;
 const PAUSA_ENTRE_CICLOS = 5 * 60 * 1000;
 
+// Cache em memória: mapeia dígitos do LID → dígitos do telefone da planilha
+// Ex: "192599335940294" → "5511999990000"
+const lidCache = new Map();
+
 // =====================================
 // CONEXÃO GOOGLE SHEETS
 // =====================================
@@ -188,38 +192,57 @@ async function atualizarStatus(linha, status, etapa, observacao = "") {
 }
 
 // =====================================
+// CAPTURAR MAPEAMENTO LID → TELEFONE
+// Após enviar, o WhatsApp já sabe que phone@c.us = LID@lid.
+// Capturamos isso via getChatById e guardamos no lidCache.
+// =====================================
+async function capturarLid(telefone) {
+  try {
+    const chat = await client.getChatById(telefone);
+    const chatId = chat?.id?._serialized || '';
+    const chatDigits = normalizarId(chatId);
+    const phoneDigits = normalizarId(telefone);
+    if (chatId.includes('@lid') && chatDigits !== phoneDigits) {
+      lidCache.set(chatDigits, phoneDigits);
+      console.log(`🔗 LID mapeado: ${chatId} → ${telefone}`);
+    }
+  } catch (e) {
+    // Não crítico — o mapeamento será tentado novamente ao receber resposta
+    console.log(`ℹ️ LID não capturado no envio (tentará ao receber): ${e.message}`);
+  }
+}
+
+// =====================================
 // ENVIAR MENSAGEM (FUNIL COMPLETO)
-// ── USA client.sendMessage DIRETAMENTE ──
-// Evita getChatById que falha quando o Puppeteer não está 100% estável
 // =====================================
 async function enviarMensagem(telefone, nomeEmpresa, etapaAtual, linha) {
   try {
-    // Garante que o cliente está realmente pronto antes de enviar
     const pronto = await aguardarClientePronto();
-    if (!pronto) {
-      throw new Error("Cliente WhatsApp não ficou pronto a tempo");
-    }
+    if (!pronto) throw new Error("Cliente WhatsApp não ficou pronto a tempo");
 
-    // Simula digitação com delay simples (sem getChatById/sendStateTyping)
     await delay(3000);
 
     if (etapaAtual === 0) {
       await client.sendMessage(telefone, `Olá, tudo bem? 👋`);
+      await capturarLid(telefone); // ← captura o LID logo após o envio
       await atualizarStatus(linha, "AGUARDANDO_RESPOSTA", 1, "MSG 1 enviada");
       console.log(`📨 MSG 1 → ${nomeEmpresa}`);
     }
     else if (etapaAtual === 1) {
       await client.sendMessage(telefone, `Queria falar com a responsável pela agenda ou atendimento, por favor.`);
+      await capturarLid(telefone);
       await atualizarStatus(linha, "AGUARDANDO_RESPOSTA", 2, "MSG 2 enviada");
       console.log(`📨 MSG 2 → ${nomeEmpresa}`);
     }
     else if (etapaAtual === 2) {
       await client.sendMessage(telefone, `Boa \n\nPesquisei por cílios na sua região e vi que tem bastante gente procurando, mas muitos perfis não estão aproveitando esse movimento.\n\nQueria te mostrar algo rápido sobre isso, pode ser?`);
+      await capturarLid(telefone);
       await atualizarStatus(linha, "AGUARDANDO_RESPOSTA", 3, "MSG 3 enviada");
       console.log(`📨 MSG 3 → ${nomeEmpresa}`);
     }
     else if (etapaAtual === 3) {
       await client.sendMessage(telefone, `Vou te mostrar uma ferramenta. Você consegue ver em tempo real:\n\nhttps://analise-perfil-google.lovable.app/\n\nDepois me fala o que apareceu aí pra você que te explico melhor!`);
+      await capturarLid(telefone);
       console.log(`📨 MSG 4 → ${nomeEmpresa}`);
       await delay(30000);
       try {
@@ -242,11 +265,14 @@ async function enviarMensagem(telefone, nomeEmpresa, etapaAtual, linha) {
 // =====================================
 // PROCESSAR RESPOSTA
 // =====================================
-async function processarResposta(idBruto, telefoneReal, texto, nomeContato) {
-  // Prioriza o telefone real (resolvido pelo contact.number)
-  // Se não disponível, cai para os dígitos do idBruto (pode ser LID — menos confiável)
-  const digitosParaBusca = telefoneReal ? normalizarId(telefoneReal) : normalizarId(idBruto);
-  console.log(`📥 Resposta de ${nomeContato} | ID bruto: ${idBruto} | Telefone real: ${telefoneReal || "LID/desconhecido"} | Buscando por: ${digitosParaBusca} | Texto: "${texto.substring(0, 50)}"`);
+// =====================================
+// PROCESSAR RESPOSTA
+// =====================================
+async function processarResposta(idBruto, texto, nomeContato) {
+  const digitosRecebidos = normalizarId(idBruto);
+  const isLid = idBruto.includes('@lid');
+  console.log(`📥 Resposta de ${nomeContato} | ${isLid ? 'LID' : 'Phone'}: ${idBruto} | Texto: "${texto.substring(0, 50)}"`);
+
   try {
     if (!sheets) await conectarPlanilha();
 
@@ -256,34 +282,68 @@ async function processarResposta(idBruto, telefoneReal, texto, nomeContato) {
     });
     const rows = response.data.values || [];
 
-    for (let i = 1; i < rows.length; i++) {
-      const row = rows[i];
-      const digitosPlanilha = normalizarId(row[1]);
+    // ── Passo 1: resolve dígitos reais via lidCache ──
+    let digitosParaBusca = digitosRecebidos;
+    if (isLid && lidCache.has(digitosRecebidos)) {
+      digitosParaBusca = lidCache.get(digitosRecebidos);
+      console.log(`✅ LID resolvido via cache: ${digitosRecebidos} → ${digitosParaBusca}`);
+    }
 
-      // Compara dígitos tolerando diferença de DDI (ex: planilha tem 11999, WA manda 5511999)
+    // ── Passo 2: busca na planilha ──
+    let matchLinha = -1;
+    for (let i = 1; i < rows.length; i++) {
+      const digitosPlanilha = normalizarId(rows[i][1]);
+      if (!digitosPlanilha) continue;
       const bate = digitosParaBusca === digitosPlanilha ||
                    digitosParaBusca.endsWith(digitosPlanilha) ||
                    digitosPlanilha.endsWith(digitosParaBusca);
+      if (bate) { matchLinha = i; break; }
+    }
 
-      if (bate) {
-        const status = row[2] || "";
-        const etapa = parseInt(row[3]) || 0;
-        const nomeEmpresa = row[0] || nomeContato;
-
-        console.log(`🔍 Lead encontrado: ${nomeEmpresa} | Status: ${status} | Etapa: ${etapa}`);
-
-        if (status === "AGUARDANDO_RESPOSTA" && etapa < 4) {
-          const telefoneFormatado = formatarTelefone(digitosPlanilha);
-          console.log(`⏳ Aguardando 15s antes de enviar próxima mensagem...`);
-          await delay(15000);
-          await enviarMensagem(telefoneFormatado, nomeEmpresa, etapa, i + 1);
-        } else {
-          console.log(`ℹ️ ${nomeEmpresa} não precisa de resposta agora (status: ${status}, etapa: ${etapa})`);
+    // ── Passo 3: se é LID e não achou, tenta resolver via getChatById ──
+    if (matchLinha === -1 && isLid) {
+      console.log(`🔍 LID não está no cache. Tentando resolver via getChatById...`);
+      for (let i = 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!['AGUARDANDO_RESPOSTA', 'NAO_INICIADO'].includes(row[2] || 'NAO_INICIADO')) continue;
+        const telefone = formatarTelefone(row[1]);
+        if (!telefone) continue;
+        try {
+          const chat = await client.getChatById(telefone);
+          const chatDigits = normalizarId(chat?.id?._serialized || '');
+          if (chatDigits === digitosRecebidos) {
+            const phoneDigits = normalizarId(row[1]);
+            lidCache.set(digitosRecebidos, phoneDigits); // salva no cache
+            console.log(`✅ LID resolvido via getChatById: ${idBruto} → ${telefone}`);
+            matchLinha = i;
+            break;
+          }
+        } catch (e) {
+          // Continua tentando os próximos
         }
-        return;
       }
     }
-    console.log(`⚠️ Nenhum lead encontrado para os dígitos: ${digitosParaBusca}`);
+
+    // ── Passo 4: processa o lead encontrado ──
+    if (matchLinha === -1) {
+      console.log(`⚠️ Nenhum lead encontrado para: ${idBruto}`);
+      return;
+    }
+
+    const row = rows[matchLinha];
+    const status = row[2] || "";
+    const etapa = parseInt(row[3]) || 0;
+    const nomeEmpresa = row[0] || nomeContato;
+    console.log(`🔍 Lead encontrado: ${nomeEmpresa} | Status: ${status} | Etapa: ${etapa}`);
+
+    if (status === "AGUARDANDO_RESPOSTA" && etapa < 4) {
+      const telefoneFormatado = formatarTelefone(normalizarId(row[1]));
+      console.log(`⏳ Aguardando 15s antes de enviar próxima mensagem...`);
+      await delay(15000);
+      await enviarMensagem(telefoneFormatado, nomeEmpresa, etapa, matchLinha + 1);
+    } else {
+      console.log(`ℹ️ ${nomeEmpresa} não precisa de resposta agora (status: ${status}, etapa: ${etapa})`);
+    }
   } catch (error) {
     console.error("❌ Erro ao processar resposta:", error);
   }
@@ -426,21 +486,16 @@ async function iniciarBot() {
     if (msg.fromMe) return;
     if (msg.from.includes("@g.us")) return;
 
-    const idBruto = msg.from; // pode ser @lid ou @c.us
+    const idBruto = msg.from;
     const texto = msg.body || "";
 
     let nomeContato = normalizarId(idBruto);
-    let telefoneReal = null; // número real resolvido pelo whatsapp-web.js
-
     try {
       const contact = await msg.getContact();
       nomeContato = contact.pushname || contact.name || nomeContato;
-      // contact.number resolve o telefone real mesmo quando msg.from é @lid
-      if (contact.number) telefoneReal = contact.number;
     } catch (_) {}
 
-    console.log(`📞 Telefone real resolvido: ${telefoneReal || "não disponível"}`);
-    await processarResposta(idBruto, telefoneReal, texto, nomeContato);
+    await processarResposta(idBruto, texto, nomeContato);
   });
 
   client.on("auth_failure", (msg) => {
