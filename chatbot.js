@@ -27,6 +27,11 @@ const MONGODB_URI = process.env.MONGODB_URI;
 
 let sheets;
 let client;
+
+// ── Flags de controle ──────────────────
+let isClientReady = false;       // true só quando WhatsApp está 100% pronto
+let prospeccaoRodando = false;   // impede múltiplos loops paralelos
+
 let enviadosHoje = 0;
 const MAX_POR_DIA = 70;
 const INTERVALO_MIN = 10 * 60 * 1000;
@@ -56,13 +61,12 @@ async function conectarPlanilha() {
 }
 
 // =====================================
-// NORMALIZAR ID WHATSAPP (resolve @lid, @c.us e números puros)
+// NORMALIZAR ID WHATSAPP
+// Extrai apenas dígitos de qualquer formato (@lid, @c.us, número puro)
 // =====================================
 function normalizarId(telefoneOuId) {
   if (!telefoneOuId) return null;
-  // Remove qualquer sufixo @... e extrai só os dígitos
-  const apenasDigitos = telefoneOuId.toString().replace(/@.+$/, '').replace(/\D/g, '');
-  return apenasDigitos;
+  return telefoneOuId.toString().replace(/@.+$/, '').replace(/\D/g, '');
 }
 
 // =====================================
@@ -70,16 +74,24 @@ function normalizarId(telefoneOuId) {
 // =====================================
 function formatarTelefone(telefone) {
   if (!telefone) return null;
-  let numero = telefone.toString().replace(/\D/g, '');
-
-  // Se já tem DDI (mais de 11 dígitos), usa como está
-  // Se tem 11 dígitos (BR com DDD+9), adiciona 55
-  // Se tem 10 dígitos (BR com DDD sem 9), adiciona 55
+  let numero = normalizarId(telefone);
   if (numero.length <= 11) {
     numero = '55' + numero;
   }
-
   return `${numero}@c.us`;
+}
+
+// =====================================
+// AGUARDAR CLIENTE PRONTO
+// Espera até 60s pelo cliente antes de desistir
+// =====================================
+async function aguardarClientePronto(tentativas = 12) {
+  for (let i = 0; i < tentativas; i++) {
+    if (isClientReady) return true;
+    console.log(`⏳ Aguardando cliente WhatsApp... (${i + 1}/${tentativas})`);
+    await delay(5000);
+  }
+  return false;
 }
 
 // =====================================
@@ -98,6 +110,7 @@ async function buscarContatosParaAbordar() {
     const hora = agora.hour();
     const diaSemana = agora.day();
     console.log(`🕐 Hora SP: ${agora.format("HH:mm")} | Dia: ${diaSemana} (0=Dom, 6=Sáb)`);
+
     if (hora < 8 || hora >= 18 || diaSemana === 0 || diaSemana === 6) {
       console.log("⏰ Fora do horário comercial. Aguardando próximo ciclo...");
       return [];
@@ -116,17 +129,27 @@ async function buscarContatosParaAbordar() {
       const etapa = parseInt(row[3]) || 0;
       const ultimoContato = row[4];
 
-      if (["CONVERTIDO", "ERRO", "AGUARDANDO_RESPOSTA", "AGUARDANDO_ENVIO"].includes(status)) {
+      // Pula status que não precisam de ação
+      if (["CONVERTIDO", "AGUARDANDO_RESPOSTA", "AGUARDANDO_ENVIO"].includes(status)) {
         continue;
       }
 
+      // ERRO: tenta de novo após 1 dia
+      if (status === "ERRO") {
+        if (!ultimoContato) continue;
+        const horasDesdeErro = moment().diff(moment(ultimoContato, "DD/MM/YYYY HH:mm:ss"), "hours");
+        if (horasDesdeErro < 24) continue;
+        console.log(`🔁 Retentativa de ERRO após ${horasDesdeErro}h: ${nomeEmpresa}`);
+      }
+
+      // Follow-up após 5 dias sem resposta
       let precisaFollowUp = false;
       if (ultimoContato && status === "AGUARDANDO_RESPOSTA") {
         const diasSemResposta = moment().diff(moment(ultimoContato, "DD/MM/YYYY HH:mm:ss"), "days");
         if (diasSemResposta >= 5) precisaFollowUp = true;
       }
 
-      if ((status === "NAO_INICIADO" || precisaFollowUp) && telefone) {
+      if ((status === "NAO_INICIADO" || status === "ERRO" || precisaFollowUp) && telefone) {
         contatos.push({
           telefone: formatarTelefone(telefone),
           nomeEmpresa,
@@ -166,11 +189,18 @@ async function atualizarStatus(linha, status, etapa, observacao = "") {
 
 // =====================================
 // ENVIAR MENSAGEM (FUNIL COMPLETO)
+// ── USA client.sendMessage DIRETAMENTE ──
+// Evita getChatById que falha quando o Puppeteer não está 100% estável
 // =====================================
 async function enviarMensagem(telefone, nomeEmpresa, etapaAtual, linha) {
   try {
-    const chat = await client.getChatById(telefone);
-    await chat.sendStateTyping();
+    // Garante que o cliente está realmente pronto antes de enviar
+    const pronto = await aguardarClientePronto();
+    if (!pronto) {
+      throw new Error("Cliente WhatsApp não ficou pronto a tempo");
+    }
+
+    // Simula digitação com delay simples (sem getChatById/sendStateTyping)
     await delay(3000);
 
     if (etapaAtual === 0) {
@@ -212,10 +242,9 @@ async function enviarMensagem(telefone, nomeEmpresa, etapaAtual, linha) {
 // =====================================
 // PROCESSAR RESPOSTA
 // =====================================
-async function processarResposta(telefone, texto, nomeContato) {
-  // Normaliza o ID recebido (remove @lid, @c.us, etc.)
-  const digitosRecebidos = normalizarId(telefone);
-  console.log(`📥 Resposta de ${nomeContato} | ID bruto: ${telefone} | Dígitos: ${digitosRecebidos} | Texto: "${texto.substring(0, 50)}"`);
+async function processarResposta(idBruto, texto, nomeContato) {
+  const digitosRecebidos = normalizarId(idBruto);
+  console.log(`📥 Resposta de ${nomeContato} | Dígitos: ${digitosRecebidos} | Texto: "${texto.substring(0, 50)}"`);
   try {
     if (!sheets) await conectarPlanilha();
 
@@ -227,10 +256,9 @@ async function processarResposta(telefone, texto, nomeContato) {
 
     for (let i = 1; i < rows.length; i++) {
       const row = rows[i];
-      // Normaliza o telefone da planilha também para comparar só dígitos
       const digitosPlanilha = normalizarId(row[1]);
 
-      // Compara os dígitos finais (últimos 11 ou 10) para tolerar DDI diferente
+      // Compara dígitos tolerando diferença de DDI
       const bate = digitosRecebidos === digitosPlanilha ||
                    digitosRecebidos.endsWith(digitosPlanilha) ||
                    digitosPlanilha.endsWith(digitosRecebidos);
@@ -243,7 +271,7 @@ async function processarResposta(telefone, texto, nomeContato) {
         console.log(`🔍 Lead encontrado: ${nomeEmpresa} | Status: ${status} | Etapa: ${etapa}`);
 
         if (status === "AGUARDANDO_RESPOSTA" && etapa < 4) {
-          // Usa o telefone formatado corretamente com @c.us para enviar
+          // Usa sempre o número limpo da planilha para enviar (formato correto)
           const telefoneFormatado = formatarTelefone(digitosPlanilha);
           console.log(`⏳ Aguardando 15s antes de enviar próxima mensagem...`);
           await delay(15000);
@@ -254,7 +282,7 @@ async function processarResposta(telefone, texto, nomeContato) {
         return;
       }
     }
-    console.log(`⚠️ Nenhum lead encontrado na planilha para os dígitos: ${digitosRecebidos}`);
+    console.log(`⚠️ Nenhum lead encontrado para os dígitos: ${digitosRecebidos}`);
   } catch (error) {
     console.error("❌ Erro ao processar resposta:", error);
   }
@@ -264,41 +292,62 @@ async function processarResposta(telefone, texto, nomeContato) {
 // PROSPECÇÃO CONTÍNUA
 // =====================================
 async function iniciarProspeccaoContinua() {
+  // ── Impede múltiplos loops paralelos ──
+  if (prospeccaoRodando) {
+    console.log("⚠️ Prospecção já está rodando. Ignorando novo disparo.");
+    return;
+  }
+  prospeccaoRodando = true;
   console.log("\n🚀 Iniciando prospecção contínua...");
+
   if (!sheets) await conectarPlanilha();
 
-  while (true) {
-    const contatos = await buscarContatosParaAbordar();
-    if (contatos.length === 0) {
-      console.log(`📭 Nenhum contato. Aguardando ${PAUSA_ENTRE_CICLOS / 60000} min...`);
+  try {
+    while (true) {
+      // Verifica se o cliente ainda está pronto
+      if (!isClientReady) {
+        console.log("⏸️ Cliente desconectado. Aguardando reconexão...");
+        const reconectou = await aguardarClientePronto(24); // até 2 min
+        if (!reconectou) {
+          console.log("❌ Não reconectou. Encerrando loop de prospecção.");
+          break;
+        }
+      }
+
+      const contatos = await buscarContatosParaAbordar();
+      if (contatos.length === 0) {
+        console.log(`📭 Nenhum contato. Aguardando ${PAUSA_ENTRE_CICLOS / 60000} min...`);
+        await delay(PAUSA_ENTRE_CICLOS);
+        continue;
+      }
+
+      let primeiroEnvio = true;
+      for (const contato of contatos) {
+        if (enviadosHoje >= MAX_POR_DIA) {
+          console.log("⏸️ Limite diário atingido. Aguardando 12h...");
+          await delay(12 * 60 * 60 * 1000);
+          enviadosHoje = 0;
+          break;
+        }
+
+        if (!primeiroEnvio) {
+          const intervalo = Math.floor(Math.random() * (INTERVALO_MAX - INTERVALO_MIN + 1) + INTERVALO_MIN);
+          console.log(`⏱️ Aguardando ${Math.round(intervalo / 60000)} min antes do próximo...`);
+          await delay(intervalo);
+        } else {
+          console.log(`⚡ Primeiro lead: envio imediato!`);
+          primeiroEnvio = false;
+        }
+
+        console.log(contato.precisaFollowUp ? `🔄 Follow-up: ${contato.nomeEmpresa}` : `📞 Novo lead: ${contato.nomeEmpresa}`);
+        const sucesso = await enviarMensagem(contato.telefone, contato.nomeEmpresa, contato.etapaAtual, contato.linha);
+        if (sucesso) enviadosHoje++;
+      }
+      console.log(`✅ Lote finalizado. Aguardando ${PAUSA_ENTRE_CICLOS / 60000} min...`);
       await delay(PAUSA_ENTRE_CICLOS);
-      continue;
     }
-
-    let primeiroEnvio = true;
-    for (const contato of contatos) {
-      if (enviadosHoje >= MAX_POR_DIA) {
-        console.log("⏸️ Limite diário atingido. Aguardando 12h...");
-        await delay(12 * 60 * 60 * 1000);
-        enviadosHoje = 0;
-        break;
-      }
-
-      if (!primeiroEnvio) {
-        const intervalo = Math.floor(Math.random() * (INTERVALO_MAX - INTERVALO_MIN + 1) + INTERVALO_MIN);
-        console.log(`⏱️ Aguardando ${Math.round(intervalo / 60000)} min antes do próximo...`);
-        await delay(intervalo);
-      } else {
-        console.log(`⚡ Primeiro lead: envio imediato!`);
-        primeiroEnvio = false;
-      }
-
-      console.log(contato.precisaFollowUp ? `🔄 Follow-up: ${contato.nomeEmpresa}` : `📞 Novo lead: ${contato.nomeEmpresa}`);
-      await enviarMensagem(contato.telefone, contato.nomeEmpresa, contato.etapaAtual, contato.linha);
-      enviadosHoje++;
-    }
-    console.log(`✅ Lote finalizado. Aguardando ${PAUSA_ENTRE_CICLOS / 60000} min...`);
-    await delay(PAUSA_ENTRE_CICLOS);
+  } finally {
+    prospeccaoRodando = false;
   }
 }
 
@@ -310,7 +359,6 @@ async function iniciarBot() {
   await mongoose.connect(MONGODB_URI);
   console.log("✅ MongoDB conectado!");
 
-  // Garante diretório com permissão de escrita para o RemoteAuth
   const authDir = "/tmp/wwebjs_auth";
   if (!fs.existsSync(authDir)) fs.mkdirSync(authDir, { recursive: true });
   process.chdir(authDir);
@@ -345,8 +393,8 @@ async function iniciarBot() {
   client.on("qr", async (qr) => {
     console.log("\n📲 QR CODE GERADO!\n");
     try {
-      const qrDataUrl = await QRCode.toDataURL(qr, { width: 500, margin: 2 });
       await QRCode.toFile("/tmp/qrcode.png", qr, { width: 500, margin: 2 });
+      const qrDataUrl = await QRCode.toDataURL(qr, { width: 500, margin: 2 });
       console.log("✅ QR salvo em /tmp/qrcode.png");
       console.log("🔗 Cole o link abaixo no navegador para visualizar o QR:");
       console.log("\n👉 " + qrDataUrl + "\n");
@@ -362,7 +410,14 @@ async function iniciarBot() {
 
   client.on("ready", () => {
     console.log("✅ WhatsApp conectado e pronto!");
-    iniciarProspeccaoContinua().catch(console.error);
+    isClientReady = true;  // ← Marca cliente como pronto
+
+    // Inicia prospecção apenas se ainda não estiver rodando
+    if (!prospeccaoRodando) {
+      iniciarProspeccaoContinua().catch(console.error);
+    } else {
+      console.log("🔄 Reconexão detectada. Loop de prospecção continua normalmente.");
+    }
   });
 
   // ✅ LISTENER DE MENSAGENS
@@ -370,16 +425,13 @@ async function iniciarBot() {
     if (msg.fromMe) return;
     if (msg.from.includes("@g.us")) return;
 
-    // Aceita tanto @c.us quanto @lid
-    const idBruto = msg.from;
-    // Extrai número sem sufixo para usar na busca
-    const telefone = idBruto.replace(/@.+$/, '');
+    const idBruto = msg.from; // preserva @lid ou @c.us original
     const texto = msg.body || "";
 
-    let nomeContato = telefone;
+    let nomeContato = normalizarId(idBruto);
     try {
       const contact = await msg.getContact();
-      nomeContato = contact.pushname || contact.name || telefone;
+      nomeContato = contact.pushname || contact.name || nomeContato;
     } catch (_) {}
 
     await processarResposta(idBruto, texto, nomeContato);
@@ -387,17 +439,18 @@ async function iniciarBot() {
 
   client.on("auth_failure", (msg) => {
     console.error("❌ Falha na autenticação:", msg);
+    isClientReady = false;
   });
 
   client.on("disconnected", (reason) => {
     console.log("⚠️ WhatsApp desconectado:", reason);
+    isClientReady = false;  // ← Marca cliente como não pronto
     console.log("🔄 Reiniciando em 15s...");
     setTimeout(() => {
       client.initialize().catch(console.error);
     }, 15000);
   });
 
-  // Captura erro global para não crashar no RemoteAuth.zip
   process.on("uncaughtException", (err) => {
     if (err.code === "ENOENT" && err.path && err.path.includes("RemoteAuth")) {
       console.warn("⚠️ Aviso RemoteAuth (não crítico):", err.message);
