@@ -242,9 +242,11 @@ async function enviarMensagem(telefone, nomeEmpresa, etapaAtual, linha) {
 // =====================================
 // PROCESSAR RESPOSTA
 // =====================================
-async function processarResposta(idBruto, texto, nomeContato) {
-  const digitosRecebidos = normalizarId(idBruto);
-  console.log(`📥 Resposta de ${nomeContato} | Dígitos: ${digitosRecebidos} | Texto: "${texto.substring(0, 50)}"`);
+async function processarResposta(idBruto, telefoneReal, texto, nomeContato) {
+  // Prioriza o telefone real (resolvido pelo contact.number)
+  // Se não disponível, cai para os dígitos do idBruto (pode ser LID — menos confiável)
+  const digitosParaBusca = telefoneReal ? normalizarId(telefoneReal) : normalizarId(idBruto);
+  console.log(`📥 Resposta de ${nomeContato} | ID bruto: ${idBruto} | Telefone real: ${telefoneReal || "LID/desconhecido"} | Buscando por: ${digitosParaBusca} | Texto: "${texto.substring(0, 50)}"`);
   try {
     if (!sheets) await conectarPlanilha();
 
@@ -258,10 +260,10 @@ async function processarResposta(idBruto, texto, nomeContato) {
       const row = rows[i];
       const digitosPlanilha = normalizarId(row[1]);
 
-      // Compara dígitos tolerando diferença de DDI
-      const bate = digitosRecebidos === digitosPlanilha ||
-                   digitosRecebidos.endsWith(digitosPlanilha) ||
-                   digitosPlanilha.endsWith(digitosRecebidos);
+      // Compara dígitos tolerando diferença de DDI (ex: planilha tem 11999, WA manda 5511999)
+      const bate = digitosParaBusca === digitosPlanilha ||
+                   digitosParaBusca.endsWith(digitosPlanilha) ||
+                   digitosPlanilha.endsWith(digitosParaBusca);
 
       if (bate) {
         const status = row[2] || "";
@@ -271,7 +273,6 @@ async function processarResposta(idBruto, texto, nomeContato) {
         console.log(`🔍 Lead encontrado: ${nomeEmpresa} | Status: ${status} | Etapa: ${etapa}`);
 
         if (status === "AGUARDANDO_RESPOSTA" && etapa < 4) {
-          // Usa sempre o número limpo da planilha para enviar (formato correto)
           const telefoneFormatado = formatarTelefone(digitosPlanilha);
           console.log(`⏳ Aguardando 15s antes de enviar próxima mensagem...`);
           await delay(15000);
@@ -282,7 +283,7 @@ async function processarResposta(idBruto, texto, nomeContato) {
         return;
       }
     }
-    console.log(`⚠️ Nenhum lead encontrado para os dígitos: ${digitosRecebidos}`);
+    console.log(`⚠️ Nenhum lead encontrado para os dígitos: ${digitosParaBusca}`);
   } catch (error) {
     console.error("❌ Erro ao processar resposta:", error);
   }
@@ -425,16 +426,21 @@ async function iniciarBot() {
     if (msg.fromMe) return;
     if (msg.from.includes("@g.us")) return;
 
-    const idBruto = msg.from; // preserva @lid ou @c.us original
+    const idBruto = msg.from; // pode ser @lid ou @c.us
     const texto = msg.body || "";
 
     let nomeContato = normalizarId(idBruto);
+    let telefoneReal = null; // número real resolvido pelo whatsapp-web.js
+
     try {
       const contact = await msg.getContact();
       nomeContato = contact.pushname || contact.name || nomeContato;
+      // contact.number resolve o telefone real mesmo quando msg.from é @lid
+      if (contact.number) telefoneReal = contact.number;
     } catch (_) {}
 
-    await processarResposta(idBruto, texto, nomeContato);
+    console.log(`📞 Telefone real resolvido: ${telefoneReal || "não disponível"}`);
+    await processarResposta(idBruto, telefoneReal, texto, nomeContato);
   });
 
   client.on("auth_failure", (msg) => {
