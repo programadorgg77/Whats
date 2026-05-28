@@ -2,7 +2,6 @@
 // IMPORTAÇÕES
 // =====================================
 const fs = require("fs");
-const http = require("http");
 const QRCode = require("qrcode");
 const { Client, RemoteAuth, MessageMedia } = require("whatsapp-web.js");
 const { MongoStore } = require("wwebjs-mongo");
@@ -393,19 +392,17 @@ async function iniciarBot() {
   });
 
   client.on("qr", async (qr) => {
-    console.log("\n📲 QR CODE GERADO!");
+    console.log("\n📲 QR CODE GERADO!\n");
     try {
-      await QRCode.toFile("/tmp/qrcode.png", qr, { width: 500, margin: 2 });
-      console.log("✅ QR salvo em /tmp/qrcode.png");
-
-      // Exibe QR direto no terminal como fallback
-      const qrTerminal = await QRCode.toString(qr, { type: "terminal", small: true });
-      console.log("\n" + qrTerminal);
+      // Gera em 256x256 — compacto o suficiente para não truncar no log do Railway
+      const qrDataUrl = await QRCode.toDataURL(qr, { width: 256, margin: 2, errorCorrectionLevel: 'M' });
+      await QRCode.toFile("/tmp/qrcode.png", qr, { width: 256, margin: 2, errorCorrectionLevel: 'M' });
+      console.log("✅ QR gerado! Cole o link abaixo no navegador:");
+      console.log("\n👉 " + qrDataUrl + "\n");
     } catch (e) {
       console.error("Erro ao gerar QR:", e.message);
     }
-    console.log("⚠️  Você tem 60 segundos para escanear!");
-    console.log("🌐 Ou acesse pelo navegador: http://SEU-SERVIDOR:3000\n");
+    console.log("⚠️  Você tem 60 segundos para escanear!\n");
   });
 
   client.on("authenticated", () => {
@@ -466,67 +463,6 @@ async function iniciarBot() {
       return;
     }
     console.error("❌ Erro não tratado:", err);
-  });
-
-  // =====================================
-  // SERVIDOR HTTP — visualizar QR no navegador
-  // Acesse: http://SEU-SERVIDOR:3000
-  // =====================================
-  const PORT = process.env.PORT || 3000;
-  const servidor = http.createServer((req, res) => {
-    const qrPath = "/tmp/qrcode.png";
-
-    if (req.url === "/" || req.url === "/qr") {
-      if (fs.existsSync(qrPath)) {
-        // Página HTML com auto-refresh a cada 10s enquanto aguarda escanear
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`
-          <!DOCTYPE html>
-          <html>
-            <head>
-              <title>WhatsApp QR Code</title>
-              <meta http-equiv="refresh" content="10">
-              <style>
-                body { font-family: sans-serif; display: flex; flex-direction: column;
-                       align-items: center; justify-content: center; min-height: 100vh;
-                       margin: 0; background: #f0f0f0; }
-                img  { width: 300px; height: 300px; border: 8px solid white;
-                       border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.2); }
-                p    { color: #555; margin-top: 16px; }
-              </style>
-            </head>
-            <body>
-              <h2>📲 Escaneie o QR Code</h2>
-              <img src="/qrcode.png?t=${Date.now()}" alt="QR Code WhatsApp"/>
-              <p>Página atualiza automaticamente a cada 10 segundos</p>
-            </body>
-          </html>
-        `);
-      } else {
-        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-        res.end(`<html><body style="font-family:sans-serif;text-align:center;padding:40px">
-          <h2>⏳ Aguardando geração do QR Code...</h2>
-          <meta http-equiv="refresh" content="3">
-          <p>Esta página vai atualizar automaticamente.</p>
-        </body></html>`);
-      }
-    } else if (req.url.startsWith("/qrcode.png")) {
-      if (fs.existsSync(qrPath)) {
-        res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "no-cache" });
-        fs.createReadStream(qrPath).pipe(res);
-      } else {
-        res.writeHead(404);
-        res.end("QR ainda não gerado");
-      }
-    } else {
-      res.writeHead(302, { Location: "/" });
-      res.end();
-    }
-  });
-
-  servidor.listen(PORT, () => {
-    console.log(`🌐 Servidor QR rodando na porta ${PORT}`);
-    console.log(`🔗 Acesse no navegador: http://SEU-SERVIDOR:${PORT}`);
   });
 
   console.log("🚀 Inicializando cliente WhatsApp...");
